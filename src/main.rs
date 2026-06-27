@@ -15,13 +15,13 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Shielded Observer",
-        options,
-        Box::new(|cc| {
-            apply_shielded_theme(&cc.egui_ctx, true);
-            Box::new(ShieldedObserverApp::new(cc))
-        }),
-    )
+    "Shielded Observer",
+    options,
+    Box::new(|cc| {
+        apply_shielded_theme(&cc.egui_ctx, true);
+        Box::new(ShieldedObserverApp::new(cc))
+    }),
+)
 }
 
 struct ShieldedObserverApp {
@@ -53,24 +53,27 @@ const BASE_PLOT_HEIGHT: f32 = 450.0;
 
 impl ShieldedObserverApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-    let conn = init_database().expect("Failed to initialize database");
-    Self {
-        dark_mode: true,
-        ui_scale: 1.0,
-        pending_scale: 1.0,
-        show_settings: false,
-        status_message: "Idle".to_string(),
-        last_update: "Never".to_string(),
-        city_input: String::new(),
-        state_input: String::new(),
-        search_result: None,
-        validated_locations: load_validated_locations(&conn),
-        current_location: None,
-        use_local_time: true,
-        show_export_window: false,
-        export_format: "CSV".to_string(),
+        let conn = match init_database() {
+            Ok(c) => c,
+            Err(e) => panic!("Failed to initialize database: {}", e),
+        };
+        Self {
+            dark_mode: true,
+            ui_scale: 1.0,
+            pending_scale: 1.0,
+            show_settings: false,
+            status_message: "Idle".to_string(),
+            last_update: "Never".to_string(),
+            city_input: String::new(),
+            state_input: String::new(),
+            search_result: None,
+            validated_locations: load_validated_locations(&conn),
+            current_location: None,
+            use_local_time: true,
+            show_export_window: false,
+            export_format: "CSV".to_string(),
+        }
     }
-}
 
     fn apply_scale(&mut self, ctx: &Context) {
         if (self.pending_scale - self.ui_scale).abs() > 0.001 {
@@ -145,7 +148,7 @@ impl ShieldedObserverApp {
         match self.export_format.as_str() {
             "CSV" => {
                 if path.extension().map_or(true, |ext| !ext.eq_ignore_ascii_case("csv")) {
-                    path.set_extension("csv");           // ← Line 150
+                    path.set_extension("csv");
                 }
                 let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
                 CsvWriter::new(&mut file)
@@ -154,7 +157,7 @@ impl ShieldedObserverApp {
             }
             "JSON" => {
                 if path.extension().map_or(true, |ext| !ext.eq_ignore_ascii_case("json")) {
-                    path.set_extension("json");          // ← Line 159
+                    path.set_extension("json");
                 }
                 let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
                 JsonWriter::new(&mut file)
@@ -163,8 +166,6 @@ impl ShieldedObserverApp {
             }
             _ => return Err("PNG export not implemented yet".to_string()),
         }
-
-        let path_str = path.to_string_lossy().to_string();
 
         // Write based on selected format
         match self.export_format.as_str() {
@@ -183,6 +184,7 @@ impl ShieldedObserverApp {
             _ => return Err("PNG export not implemented yet".to_string()),
         }
 
+        let path_str = path.to_string_lossy().to_string();
         Ok(path_str)
     }
 }
@@ -268,10 +270,23 @@ impl App for ShieldedObserverApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Main Content Area");
+
             if let Some(loc) = &self.current_location {
-                ui.label(format!("Current Location: {}, {}", loc.city, loc.state));
+                // === NEW: Show station ID if available ===
+                let station_id = get_latest_station_id(loc).unwrap_or_else(|_| "—".to_string());
+                let station_url = format!("https://api.weather.gov/stations/{}/observations", station_id);
+
+                ui.horizontal(|ui| {
+                    ui.label(format!("Current Location: {}, {}", loc.city, loc.state));
+                    if station_id != "—" {
+                        ui.hyperlink_to(format!("(Station: {})", station_id), station_url);
+                    }
+                });
                 ui.label(format!("Coordinates: {:.4}, {:.4}", loc.lat, loc.lon));
+                // =========================================
+
                 ui.add_space(15.0);
+
                 if ui.button("Collect Now").clicked() {
                     match collect_hourly_forecast(loc) {
                         Ok(count) => {
@@ -283,6 +298,7 @@ impl App for ShieldedObserverApp {
                         }
                     }
                 }
+
                 ui.add_space(25.0);
 
                 let scale = self.ui_scale;
@@ -352,6 +368,7 @@ impl App for ShieldedObserverApp {
                         ui.label("Failed to load temperature data.");
                     }
                 }
+
                 ui.add_space(15.0);
 
                 // Wind Speed
@@ -379,6 +396,7 @@ impl App for ShieldedObserverApp {
                         ui.label("Failed to load wind speed data.");
                     }
                 }
+
                 ui.add_space(15.0);
 
                 // Relative Humidity
@@ -558,12 +576,13 @@ fn get_latest_collection_time(conn: &Connection, loc: &LocationResult) -> rusqli
 
 fn get_temp_and_dewpoint_data(loc: &LocationResult) -> Result<(Vec<[f64; 2]>, Vec<[f64; 2]>), Box<dyn std::error::Error>> {
     let conn = init_database()?;
-    let collected_at = match get_latest_collection_time(&conn, loc)? {
-        Some(t) => t,
-        None => return Ok((vec![], vec![])),
-    };
-    let mut stmt = conn.prepare("SELECT start_time, temperature, dewpoint FROM hourly_forecasts WHERE city = ?1 AND state = ?2 AND collected_at = ?3 ORDER BY start_time ASC")?;
-    let mut rows = stmt.query(params![loc.city, loc.state, collected_at])?;
+    let mut stmt = conn.prepare(
+        "SELECT observation_time, temperature, dewpoint FROM hourly_forecasts 
+         WHERE city = ?1 AND state = ?2 
+         ORDER BY observation_time ASC 
+         LIMIT 500"
+    )?;
+    let mut rows = stmt.query(params![loc.city, loc.state])?;
     let mut temp_points = Vec::new();
     let mut dew_points = Vec::new();
     while let Some(row) = rows.next()? {
@@ -582,12 +601,13 @@ fn get_temp_and_dewpoint_data(loc: &LocationResult) -> Result<(Vec<[f64; 2]>, Ve
 
 fn get_wind_speed_data(loc: &LocationResult) -> Result<Vec<[f64; 2]>, Box<dyn std::error::Error>> {
     let conn = init_database()?;
-    let collected_at = match get_latest_collection_time(&conn, loc)? {
-        Some(t) => t,
-        None => return Ok(vec![]),
-    };
-    let mut stmt = conn.prepare("SELECT start_time, wind_speed FROM hourly_forecasts WHERE city = ?1 AND state = ?2 AND collected_at = ?3 ORDER BY start_time ASC")?;
-    let mut rows = stmt.query(params![loc.city, loc.state, collected_at])?;
+    let mut stmt = conn.prepare(
+        "SELECT observation_time, wind_speed FROM hourly_forecasts 
+         WHERE city = ?1 AND state = ?2 
+         ORDER BY observation_time ASC 
+         LIMIT 500"
+    )?;
+    let mut rows = stmt.query(params![loc.city, loc.state])?;
     let mut points = Vec::new();
     while let Some(row) = rows.next()? {
         let time_str: String = row.get(0)?;
@@ -604,12 +624,13 @@ fn get_wind_speed_data(loc: &LocationResult) -> Result<Vec<[f64; 2]>, Box<dyn st
 
 fn get_relative_humidity_data(loc: &LocationResult) -> Result<Vec<[f64; 2]>, Box<dyn std::error::Error>> {
     let conn = init_database()?;
-    let collected_at = match get_latest_collection_time(&conn, loc)? {
-        Some(t) => t,
-        None => return Ok(vec![]),
-    };
-    let mut stmt = conn.prepare("SELECT start_time, relative_humidity FROM hourly_forecasts WHERE city = ?1 AND state = ?2 AND collected_at = ?3 ORDER BY start_time ASC")?;
-    let mut rows = stmt.query(params![loc.city, loc.state, collected_at])?;
+    let mut stmt = conn.prepare(
+        "SELECT observation_time, relative_humidity FROM hourly_forecasts 
+         WHERE city = ?1 AND state = ?2 
+         ORDER BY observation_time ASC 
+         LIMIT 500"
+    )?;
+    let mut rows = stmt.query(params![loc.city, loc.state])?;
     let mut points = Vec::new();
     while let Some(row) = rows.next()? {
         let time_str: String = row.get(0)?;
@@ -631,7 +652,26 @@ fn parse_wind_speed(s: &str) -> Option<f64> {
 fn init_database() -> rusqlite::Result<Connection> {
     let conn = Connection::open("shielded_observer.db")?;
     conn.execute("CREATE TABLE IF NOT EXISTS validated_locations (id INTEGER PRIMARY KEY, city TEXT NOT NULL, state TEXT NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL, last_validated INTEGER NOT NULL, UNIQUE(city, state))", [])?;
-    conn.execute("CREATE TABLE IF NOT EXISTS hourly_forecasts (id INTEGER PRIMARY KEY, city TEXT NOT NULL, state TEXT NOT NULL, start_time TEXT NOT NULL, temperature REAL, dewpoint REAL, relative_humidity REAL, wind_speed TEXT, wind_direction TEXT, pop REAL, short_forecast TEXT, collected_at INTEGER NOT NULL)", [])?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS hourly_forecasts (
+            id INTEGER PRIMARY KEY,
+            city TEXT NOT NULL,
+            state TEXT NOT NULL,
+            station_id TEXT,
+            observation_time TEXT,
+            start_time TEXT,
+            temperature REAL,
+            dewpoint REAL,
+            relative_humidity REAL,
+            wind_speed TEXT,
+            wind_direction TEXT,
+            pop REAL,
+            short_forecast TEXT,
+            collected_at INTEGER NOT NULL,
+            UNIQUE(observation_time, station_id, city, state)
+        )",
+        [],
+    )?;
     Ok(conn)
 }
 
@@ -654,29 +694,80 @@ fn delete_validated_location(city: &str, state: &str) -> rusqlite::Result<()> {
 }
 
 fn collect_hourly_forecast(loc: &LocationResult) -> Result<usize, String> {
-    let point_url = format!("https://api.weather.gov/points/{},{}", loc.lat, loc.lon);
     let client = reqwest::blocking::Client::builder()
         .user_agent("shielded-observer/0.1 (https://github.com/dismad/shielded-observer)")
         .build()
         .map_err(|e| e.to_string())?;
+
+    // 1. Get station list from the point
+    let point_url = format!("https://api.weather.gov/points/{},{}", loc.lat, loc.lon);
     let point_resp: serde_json::Value = client.get(&point_url).send().map_err(|e| e.to_string())?.json().map_err(|e| e.to_string())?;
-    let forecast_url = point_resp["properties"]["forecastHourly"].as_str().ok_or("Could not find forecastHourly URL")?;
-    let forecast_resp: serde_json::Value = client.get(forecast_url).send().map_err(|e| e.to_string())?.json().map_err(|e| e.to_string())?;
-    let periods = forecast_resp["properties"]["periods"].as_array().ok_or("No periods found")?;
+    let stations_url = point_resp["properties"]["observationStations"].as_str().ok_or("Could not find observationStations URL")?;
+
+    // 2. Get list of stations and pick the first one (closest)
+    let stations_resp: serde_json::Value = client.get(stations_url).send().map_err(|e| e.to_string())?.json().map_err(|e| e.to_string())?;
+    let features = stations_resp["features"].as_array().ok_or("No stations found")?;
+    if features.is_empty() {
+        return Err("No weather stations found near this location".to_string());
+    }
+    let station_id = features[0]["id"].as_str().ok_or("Invalid station data")?;
+    // Extract just the station identifier (e.g. "KONT" from full URL)
+    let station_id_short = station_id.split('/').last().unwrap_or(station_id);
+
+    // 3. Fetch recent observations (last ~24h or latest available)
+    let observations_url = format!("{}/observations?limit=500", station_id);
+    let obs_resp: serde_json::Value = client.get(&observations_url).send().map_err(|e| e.to_string())?.json().map_err(|e| e.to_string())?;
+    let observations = obs_resp["features"].as_array().ok_or("No observations found")?;
+
     let conn = init_database().map_err(|e| e.to_string())?;
     let collected_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
     let mut count = 0;
-    for period in periods {
-        let temp = period["temperature"].as_f64();
-        let dewpoint_c = period["dewpoint"]["value"].as_f64();
-        let dewpoint_f = dewpoint_c.map(|c| c * 9.0 / 5.0 + 32.0);
-        let humidity = period["relativeHumidity"]["value"].as_f64();
-        conn.execute(
-            "INSERT INTO hourly_forecasts (city, state, start_time, temperature, dewpoint, relative_humidity, wind_speed, wind_direction, pop, short_forecast, collected_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![loc.city, loc.state, period["startTime"].as_str().unwrap_or(""), temp, dewpoint_f, humidity, period["windSpeed"].as_str(), period["windDirection"].as_str(), period["probabilityOfPrecipitation"]["value"].as_f64(), period["shortForecast"].as_str(), collected_at],
-        ).map_err(|e| e.to_string())?;
-        count += 1;
+
+    for obs in observations {
+    let props = &obs["properties"];
+
+    let obs_time = props["timestamp"].as_str().unwrap_or("").to_string();
+    if obs_time.is_empty() {
+        continue;
     }
+
+    // Convert from Celsius to Fahrenheit
+    let temp_c = props["temperature"]["value"].as_f64();
+    let temp_f = temp_c.map(|c| c * 9.0 / 5.0 + 32.0);
+
+    let dewpoint_c = props["dewpoint"]["value"].as_f64();
+    let dewpoint_f = dewpoint_c.map(|c| c * 9.0 / 5.0 + 32.0);
+
+    let humidity = props["relativeHumidity"]["value"].as_f64();
+
+    // Convert wind speed from m/s to mph
+    let wind_speed = props["windSpeed"]["value"].as_f64()
+        .map(|mps| format!("{:.1} mph", mps * 2.23694));
+
+    let wind_dir = props["windDirection"]["value"].as_f64()
+        .map(|v| format!("{:.0}°", v));
+
+    conn.execute(
+        "INSERT OR IGNORE INTO hourly_forecasts
+         (city, state, station_id, observation_time, temperature, dewpoint, relative_humidity, wind_speed, wind_direction, collected_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            loc.city,
+            loc.state,
+            station_id_short,
+            obs_time,
+            temp_f,
+            dewpoint_f,
+            humidity,
+            wind_speed,
+            wind_dir,
+            collected_at
+        ],
+    ).map_err(|e| e.to_string())?;
+
+    count += 1;
+}
+
     Ok(count)
 }
 
@@ -713,6 +804,17 @@ fn check_cache(conn: &Connection, city: &str, state: &str) -> rusqlite::Result<O
     } else {
         Ok(None)
     }
+}
+
+fn get_latest_station_id(loc: &LocationResult) -> rusqlite::Result<String> {
+    let conn = init_database()?;
+    let mut stmt = conn.prepare(
+        "SELECT station_id FROM hourly_forecasts 
+         WHERE city = ?1 AND state = ?2 
+         ORDER BY collected_at DESC 
+         LIMIT 1"
+    )?;
+    stmt.query_row(params![loc.city, loc.state], |row| row.get(0))
 }
 
 fn apply_shielded_theme(ctx: &Context, dark: bool) {
