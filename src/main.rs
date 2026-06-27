@@ -39,6 +39,23 @@ struct ShieldedObserverApp {
     use_local_time: bool,
     show_export_window: bool,
     export_format: String,
+    selected_time_range: TimeRange,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TimeRange {
+    Last6Hours,
+    Last12Hours,
+    Last24Hours,
+    Last7Days,
+    Last30Days,
+    All,
+}
+
+impl Default for TimeRange {
+    fn default() -> Self {
+        TimeRange::Last7Days
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +89,7 @@ impl ShieldedObserverApp {
             use_local_time: true,
             show_export_window: false,
             export_format: "CSV".to_string(),
+            selected_time_range: TimeRange::Last7Days,
         }
     }
 
@@ -301,14 +319,52 @@ impl App for ShieldedObserverApp {
 
                 ui.add_space(25.0);
 
+		// === Time Range Selection ===
+		ui.horizontal(|ui| {
+		    ui.label("Time Range:");
+
+		    if ui.selectable_label(self.selected_time_range == TimeRange::Last6Hours, "Last 6h").clicked() {
+			self.selected_time_range = TimeRange::Last6Hours;
+		    }
+		    if ui.selectable_label(self.selected_time_range == TimeRange::Last12Hours, "Last 12h").clicked() {
+			self.selected_time_range = TimeRange::Last12Hours;
+		    }
+		    if ui.selectable_label(self.selected_time_range == TimeRange::Last24Hours, "Last 24h").clicked() {
+			self.selected_time_range = TimeRange::Last24Hours;
+		    }
+		    if ui.selectable_label(self.selected_time_range == TimeRange::Last7Days, "Last 7 Days").clicked() {
+			self.selected_time_range = TimeRange::Last7Days;
+		    }
+		    if ui.selectable_label(self.selected_time_range == TimeRange::Last30Days, "Last 30 Days").clicked() {
+			self.selected_time_range = TimeRange::Last30Days;
+		    }
+		    if ui.selectable_label(self.selected_time_range == TimeRange::All, "All Data").clicked() {
+			self.selected_time_range = TimeRange::All;
+		    }
+		});
+
+		ui.add_space(15.0);
+
+
+
+
+
                 let scale = self.ui_scale;
                 let plot_height = BASE_PLOT_HEIGHT / scale;
                 let label_size = 12.0 / scale;
                 let use_local = self.use_local_time;
 
+
+		// Legend for combined Temperature + Dewpoint graph
+		ui.horizontal(|ui| {
+		    ui.colored_label(Color32::from_rgb(220, 50, 50), "● Temperature");
+		    ui.add_space(12.0);
+		    ui.colored_label(Color32::from_rgb(50, 180, 80), "● Dewpoint");
+		});
+
                 // Temperature + Dewpoint
                 ui.heading("Temperature + Dewpoint (°F)");
-                match get_temp_and_dewpoint_data(loc) {
+                match get_temp_and_dewpoint_data(loc, self.selected_time_range) {
                     Ok((temp_points, dew_points)) => {
                         if !temp_points.is_empty() || !dew_points.is_empty() {
                             Plot::new("temp_dew_plot")
@@ -373,7 +429,7 @@ impl App for ShieldedObserverApp {
 
                 // Wind Speed
                 ui.heading("Wind Speed (mph)");
-                match get_wind_speed_data(loc) {
+                match get_wind_speed_data(loc, self.selected_time_range) {
                     Ok(points) => {
                         if !points.is_empty() {
                             Plot::new("wind_plot")
@@ -397,33 +453,95 @@ impl App for ShieldedObserverApp {
                     }
                 }
 
+		ui.add_space(4.0);
+
+		// === Wind Direction Strip (Binned + Themed) ===
+		if let Ok(wind_data) = get_wind_observations(loc) {
+		    let binned = bin_wind_direction_hourly(&wind_data);
+
+		    if !binned.is_empty() {
+			// Use theme-aware color for good contrast in both modes
+			let label_color = ui.visuals().strong_text_color();
+
+			Plot::new("wind_direction_binned")
+			    .height(55.0)
+			    .allow_drag(false)
+			    .allow_zoom(false)
+			    .allow_scroll(false)
+			    .allow_boxed_zoom(false)
+			    .show_x(false)
+			    .show_y(false)
+			    .x_axis_formatter(move |mark: GridMark, _step: usize, range: &std::ops::RangeInclusive<f64>| {
+				format_time_label(mark, range, use_local)
+			    })
+			    .show(ui, |plot_ui| {
+				
+
+				let mut last_cardinal: Option<String> = None;
+				let mut last_forced_label_time: f64 = f64::NEG_INFINITY;
+				let forced_label_interval: f64 = 0.5 * 60.0 * 60.0; // 30 minutes
+
+				for bin in &binned {
+				    if let Some(dir) = bin.direction {
+				        let cardinal = degrees_to_cardinal(dir).to_string();
+
+				        let cardinal_changed = match &last_cardinal {
+				            Some(prev) => *prev != cardinal,
+				            None => true,
+				        };
+
+				        let time_since_forced = bin.time - last_forced_label_time;
+				        let should_force_label = time_since_forced > forced_label_interval;
+
+				        if cardinal_changed || should_force_label {
+				            plot_ui.text(
+				                Text::new(
+				                    egui_plot::PlotPoint::new(bin.time, 0.5),
+				                    RichText::new(&cardinal).size(11.0)
+				                )
+				                .color(label_color)
+				                .anchor(egui::Align2::CENTER_CENTER)
+				            );
+
+				            last_cardinal = Some(cardinal);
+
+				            if should_force_label {
+				                last_forced_label_time = bin.time;
+				            }
+				        }
+				    }
+				}
+			    });
+		    }
+		}
+ 
                 ui.add_space(15.0);
 
                 // Relative Humidity
-                ui.heading("Relative Humidity (%)");
-                match get_relative_humidity_data(loc) {
-                    Ok(points) => {
-                        if !points.is_empty() {
-                            Plot::new("humidity_plot")
-                                .height(plot_height)
-                                .allow_drag(false)
-                                .allow_zoom(false)
-                                .allow_scroll(false)
-                                .allow_boxed_zoom(false)
-                                .x_axis_formatter(move |mark: GridMark, _step: usize, range: &std::ops::RangeInclusive<f64>| {
-                                    format_time_label(mark, range, use_local)
-                                })
-                                .show(ui, |plot_ui| {
-                                    plot_with_labels(plot_ui, &points, Color32::from_rgb(80, 160, 220), true, label_size);
-                                });
-                        } else {
-                            ui.label("No humidity data yet. Click 'Collect Now'.");
-                        }
-                    }
-                    Err(_) => {
-                        ui.label("Failed to load humidity data.");
-                    }
-                }
+		ui.heading("Relative Humidity (%)");
+		match get_relative_humidity_data(loc, self.selected_time_range) {
+		    Ok(points) => {
+			if !points.is_empty() {
+			    Plot::new("humidity_plot")
+				.height(plot_height)
+				.allow_drag(false)
+				.allow_zoom(false)
+				.allow_scroll(false)
+				.allow_boxed_zoom(false)
+				.x_axis_formatter(move |mark: GridMark, _step: usize, range: &std::ops::RangeInclusive<f64>| {
+				    format_time_label(mark, range, use_local)
+				})
+				.show(ui, |plot_ui| {
+				    plot_with_labels(plot_ui, &points, Color32::from_rgb(80, 180, 200), true, label_size); // ← Changed color
+				});
+			} else {
+			    ui.label("No humidity data yet. Click 'Collect Now'.");
+			}
+		    }
+		    Err(_) => {
+			ui.label("Failed to load humidity data.");
+		    }
+		}
             } else {
                 ui.label("No location selected yet.");
             }
@@ -531,6 +649,74 @@ impl App for ShieldedObserverApp {
 }
 
 // ==================== Helper Functions ====================
+
+#[derive(Clone, Debug)]
+pub struct BinnedWindDirection {
+    pub time: f64,           // Start of the hour (unix timestamp)
+    pub direction: Option<f64>, // Vector-averaged direction in degrees
+}
+
+fn bin_wind_direction_hourly(observations: &[WindObservation]) -> Vec<BinnedWindDirection> {
+    if observations.is_empty() {
+        return vec![];
+    }
+
+    let mut binned = Vec::new();
+    let mut current_hour_start: Option<i64> = None;
+    let mut sin_sum: f64 = 0.0;
+    let mut cos_sum: f64 = 0.0;
+    let mut count = 0;
+
+    for obs in observations {
+        if let Some(dir) = obs.direction {
+            let hour_start = (obs.time / 3600.0).floor() as i64 * 3600;
+
+            if current_hour_start.is_none() {
+                current_hour_start = Some(hour_start);
+            }
+
+            if hour_start != current_hour_start.unwrap() {
+                // Finalize previous hour
+                if count > 0 {
+                    let avg_rad = sin_sum.atan2(cos_sum);
+                    let avg_deg = (avg_rad.to_degrees() + 360.0) % 360.0;
+
+                    binned.push(BinnedWindDirection {
+                        time: current_hour_start.unwrap() as f64,
+                        direction: Some(avg_deg),
+                    });
+                }
+
+                // Start new hour
+                current_hour_start = Some(hour_start);
+                sin_sum = 0.0;
+                cos_sum = 0.0;
+                count = 0;
+            }
+
+            let rad = dir.to_radians();
+            sin_sum += rad.sin();
+            cos_sum += rad.cos();
+            count += 1;
+        }
+    }
+
+    // Don't forget the last hour
+    if count > 0 {
+        if let Some(hour_start) = current_hour_start {
+            let avg_rad = sin_sum.atan2(cos_sum);
+            let avg_deg = (avg_rad.to_degrees() + 360.0) % 360.0;
+
+            binned.push(BinnedWindDirection {
+                time: hour_start as f64,
+                direction: Some(avg_deg),
+            });
+        }
+    }
+
+    binned
+}
+
 fn format_time_label(mark: GridMark, _range: &std::ops::RangeInclusive<f64>, use_local: bool) -> String {
     let ts = mark.value as i64;
     let dt_utc = match chrono::Utc.timestamp_opt(ts, 0).single() {
@@ -569,76 +755,226 @@ fn plot_with_labels(plot_ui: &mut egui_plot::PlotUi, points: &[[f64; 2]], color:
 }
 
 // ==================== Data Access Helpers ====================
+
+
+fn get_time_range_start(range: TimeRange) -> Option<i64> {
+    let now = chrono::Utc::now().timestamp();
+
+    match range {
+        TimeRange::Last6Hours  => Some(now - 6 * 60 * 60),
+        TimeRange::Last12Hours => Some(now - 12 * 60 * 60),
+        TimeRange::Last24Hours => Some(now - 24 * 60 * 60),
+        TimeRange::Last7Days   => Some(now - 7 * 24 * 60 * 60),
+        TimeRange::Last30Days  => Some(now - 30 * 24 * 60 * 60),
+        TimeRange::All         => None,
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WindObservation {
+    pub time: f64,           // Unix timestamp
+    pub speed: f64,          // in mph
+    pub direction: Option<f64>, // degrees (0-360), None if missing
+}
+
+fn get_wind_observations(loc: &LocationResult) -> Result<Vec<WindObservation>, Box<dyn std::error::Error>> {
+    let conn = init_database()?;
+    let mut stmt = conn.prepare(
+        "SELECT observation_time, wind_speed, wind_direction 
+         FROM hourly_forecasts 
+         WHERE city = ?1 AND state = ?2 
+         ORDER BY observation_time ASC 
+         LIMIT 500"
+    )?;
+
+    let mut rows = stmt.query(params![loc.city, loc.state])?;
+    let mut observations = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        let time_str: String = row.get(0)?;
+        let wind_speed_str: Option<String> = row.get(1)?;
+        let wind_dir_str: Option<String> = row.get(2)?;
+
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&time_str) {
+            let time = dt.with_timezone(&chrono::Utc).timestamp() as f64;
+
+            let speed = wind_speed_str
+                .as_deref()
+                .and_then(parse_wind_speed)
+                .unwrap_or(0.0);
+
+            let direction = wind_dir_str
+                .as_deref()
+                .and_then(|s| s.trim_end_matches('°').parse::<f64>().ok());
+
+            observations.push(WindObservation {
+                time,
+                speed,
+                direction,
+            });
+        }
+    }
+
+    Ok(observations)
+}
+
+fn degrees_to_cardinal(degrees: f64) -> &'static str {
+    let dir = (degrees % 360.0 + 360.0) % 360.0;
+    match dir {
+        d if d < 22.5 || d >= 337.5 => "N",
+        d if d < 67.5 => "NE",
+        d if d < 112.5 => "E",
+        d if d < 157.5 => "SE",
+        d if d < 202.5 => "S",
+        d if d < 247.5 => "SW",
+        d if d < 292.5 => "W",
+        d if d < 337.5 => "NW",
+        _ => "?",
+    }
+}
+
 fn get_latest_collection_time(conn: &Connection, loc: &LocationResult) -> rusqlite::Result<Option<i64>> {
     let mut stmt = conn.prepare("SELECT MAX(collected_at) FROM hourly_forecasts WHERE city = ?1 AND state = ?2")?;
     stmt.query_row(params![loc.city, loc.state], |row| row.get(0))
 }
 
-fn get_temp_and_dewpoint_data(loc: &LocationResult) -> Result<(Vec<[f64; 2]>, Vec<[f64; 2]>), Box<dyn std::error::Error>> {
+fn get_temp_and_dewpoint_data(
+    loc: &LocationResult,
+    range: TimeRange,
+) -> Result<(Vec<[f64; 2]>, Vec<[f64; 2]>), Box<dyn std::error::Error>> {
     let conn = init_database()?;
-    let mut stmt = conn.prepare(
-        "SELECT observation_time, temperature, dewpoint FROM hourly_forecasts 
-         WHERE city = ?1 AND state = ?2 
-         ORDER BY observation_time ASC 
-         LIMIT 500"
-    )?;
-    let mut rows = stmt.query(params![loc.city, loc.state])?;
+    let start_time = get_time_range_start(range);
+
+    let query = match start_time {
+        Some(_) => {
+            "SELECT observation_time, temperature, dewpoint 
+             FROM hourly_forecasts 
+             WHERE city = ?1 AND state = ?2 AND observation_time >= datetime(?3, 'unixepoch')
+             ORDER BY observation_time ASC"
+        }
+        None => {
+            "SELECT observation_time, temperature, dewpoint 
+             FROM hourly_forecasts 
+             WHERE city = ?1 AND state = ?2 
+             ORDER BY observation_time ASC"
+        }
+    };
+
+    let mut stmt = conn.prepare(query)?;
+    let mut rows = if let Some(start) = start_time {
+        stmt.query(params![loc.city, loc.state, start])?
+    } else {
+        stmt.query(params![loc.city, loc.state])?
+    };
+
     let mut temp_points = Vec::new();
     let mut dew_points = Vec::new();
+
     while let Some(row) = rows.next()? {
         let time_str: String = row.get(0)?;
         let temp: Option<f64> = row.get(1)?;
         let dew: Option<f64> = row.get(2)?;
+
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&time_str) {
-            let dt = dt.with_timezone(&chrono::Utc);
-            let x = dt.timestamp() as f64;
-            temp_points.push([x, temp.unwrap_or(0.0)]);
-            dew_points.push([x, dew.unwrap_or(0.0)]);
+            let x = dt.with_timezone(&chrono::Utc).timestamp() as f64;
+            if let Some(t) = temp {
+                temp_points.push([x, t]);
+            }
+            if let Some(d) = dew {
+                dew_points.push([x, d]);
+            }
         }
     }
     Ok((temp_points, dew_points))
 }
 
-fn get_wind_speed_data(loc: &LocationResult) -> Result<Vec<[f64; 2]>, Box<dyn std::error::Error>> {
+fn get_wind_speed_data(
+    loc: &LocationResult,
+    range: TimeRange,
+) -> Result<Vec<[f64; 2]>, Box<dyn std::error::Error>> {
     let conn = init_database()?;
-    let mut stmt = conn.prepare(
-        "SELECT observation_time, wind_speed FROM hourly_forecasts 
-         WHERE city = ?1 AND state = ?2 
-         ORDER BY observation_time ASC 
-         LIMIT 500"
-    )?;
-    let mut rows = stmt.query(params![loc.city, loc.state])?;
+    let start_time = get_time_range_start(range);
+
+    let query = match start_time {
+        Some(_) => {
+            "SELECT observation_time, wind_speed 
+             FROM hourly_forecasts 
+             WHERE city = ?1 AND state = ?2 AND observation_time >= datetime(?3, 'unixepoch')
+             ORDER BY observation_time ASC"
+        }
+        None => {
+            "SELECT observation_time, wind_speed 
+             FROM hourly_forecasts 
+             WHERE city = ?1 AND state = ?2 
+             ORDER BY observation_time ASC"
+        }
+    };
+
+    let mut stmt = conn.prepare(query)?;
+    let mut rows = if let Some(start) = start_time {
+        stmt.query(params![loc.city, loc.state, start])?
+    } else {
+        stmt.query(params![loc.city, loc.state])?
+    };
+
     let mut points = Vec::new();
+
     while let Some(row) = rows.next()? {
         let time_str: String = row.get(0)?;
         let wind_str: Option<String> = row.get(1)?;
+
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&time_str) {
-            let dt = dt.with_timezone(&chrono::Utc);
-            let x = dt.timestamp() as f64;
-            let speed = wind_str.as_deref().and_then(parse_wind_speed).unwrap_or(0.0);
-            points.push([x, speed]);
+            if let Some(wind_str) = wind_str {
+                if let Some(speed) = parse_wind_speed(&wind_str) {
+                    let x = dt.with_timezone(&chrono::Utc).timestamp() as f64;
+                    points.push([x, speed]);
+                }
+            }
         }
     }
     Ok(points)
 }
 
-fn get_relative_humidity_data(loc: &LocationResult) -> Result<Vec<[f64; 2]>, Box<dyn std::error::Error>> {
+fn get_relative_humidity_data(
+    loc: &LocationResult,
+    range: TimeRange,
+) -> Result<Vec<[f64; 2]>, Box<dyn std::error::Error>> {
     let conn = init_database()?;
-    let mut stmt = conn.prepare(
-        "SELECT observation_time, relative_humidity FROM hourly_forecasts 
-         WHERE city = ?1 AND state = ?2 
-         ORDER BY observation_time ASC 
-         LIMIT 500"
-    )?;
-    let mut rows = stmt.query(params![loc.city, loc.state])?;
+    let start_time = get_time_range_start(range);
+
+    let query = match start_time {
+        Some(_) => {
+            "SELECT observation_time, relative_humidity 
+             FROM hourly_forecasts 
+             WHERE city = ?1 AND state = ?2 AND observation_time >= datetime(?3, 'unixepoch')
+             ORDER BY observation_time ASC"
+        }
+        None => {
+            "SELECT observation_time, relative_humidity 
+             FROM hourly_forecasts 
+             WHERE city = ?1 AND state = ?2 
+             ORDER BY observation_time ASC"
+        }
+    };
+
+    let mut stmt = conn.prepare(query)?;
+    let mut rows = if let Some(start) = start_time {
+        stmt.query(params![loc.city, loc.state, start])?
+    } else {
+        stmt.query(params![loc.city, loc.state])?
+    };
+
     let mut points = Vec::new();
+
     while let Some(row) = rows.next()? {
         let time_str: String = row.get(0)?;
         let humidity: Option<f64> = row.get(1)?;
+
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&time_str) {
-            let dt = dt.with_timezone(&chrono::Utc);
-            let x = dt.timestamp() as f64;
-            points.push([x, humidity.unwrap_or(0.0)]);
+            if let Some(h) = humidity {
+                let x = dt.with_timezone(&chrono::Utc).timestamp() as f64;
+                points.push([x, h]);
+            }
         }
     }
     Ok(points)
